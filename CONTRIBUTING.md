@@ -53,7 +53,8 @@ CI reports **one required check**, plus a scheduled workflow that is deliberatel
 part of it:
 
 - **`ci`** — required, and the only check that gates a merge. Runs typecheck, lint, the
-  unit tests, and the **enforcement-path evidence gate**. It touches no secret, so
+  **relative documentation link check**, the unit tests, and the **enforcement-path
+  evidence gate**. It touches no secret, so
   nothing in it can silently mask a skip: every step either really runs or the job
   fails.
 - **`live-suite`** (`.github/workflows/live-suite.yml`) — **never run on a pull
@@ -124,6 +125,7 @@ chat log.
 ```bash
 npm run typecheck
 npm run lint
+npm run check:docs        # fails on a broken relative link in README.md or docs/
 npm test
 npm run build && npm run test:exports   # packs the tarball and resolves every export
 npm run test:integration   # live testnet; needs .env.phase2 (template: .env.phase2.example)

@@ -50,6 +50,14 @@ jobs:
       - name: lint
         run: npm run lint
 
+      # Structural gate for the docs tree (issue #78): every relative link in
+      # README.md and docs/**/*.md must resolve to a file or directory on disk.
+      # Deliberately relative-only — fetching external URLs would make a docs
+      # edit flaky on shared runners for reasons this repo cannot control. No
+      # network, no secret.
+      - name: documentation link check (relative)
+        run: npm run check:docs
+
       - name: unit tests
         run: npm test
 
