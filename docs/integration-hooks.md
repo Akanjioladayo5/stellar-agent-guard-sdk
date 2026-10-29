@@ -18,6 +18,8 @@ file.
 |---|---|---|
 | LangChain | `AgentMiddleware.wrap_tool_call` | **Confirmed** |
 | ElizaOS | `Action.validate` | **Confirmed** |
+| MCP | registered tool handler / client `callTool` | **Confirmed** — see §4 |
+| Vercel AI SDK | tool `execute` function | **Confirmed** — see §5 |
 | AutoGPT | none exposed to third parties | **Confirmed absent** — see §3 |
 
 The rule this document enforces: a framework gets an adapter only if a genuine
@@ -396,6 +398,126 @@ moderation path. The negative finding stands.
 
 ---
 
+## 4. MCP (Model Context Protocol) — registered tool handler / client `callTool`
+
+**Last verified: 2026-09-30.**
+
+MCP is mid-migration between two published generations of the TypeScript SDK, so
+both were reviewed before writing the adapter:
+
+| Generation | Package | Pin |
+| --- | --- | --- |
+| v2 (current line, spec `2026-07-28`) | `@modelcontextprotocol/server`, `@modelcontextprotocol/client` | `modelcontextprotocol/typescript-sdk` `main`, `README.md` blob `6d5e2328efd2fc4493731b4e4cfd2e117ad1e28d` |
+| v1 (legacy; bug/security fixes) | `@modelcontextprotocol/sdk` (latest 1.30.1) | `modelcontextprotocol/typescript-sdk` `v1.x`, `README.md` blob `2d2f19ae376bee6081437c4d6f8e251bf3fd3ce5` |
+
+### The hook
+
+An MCP server exposes a tool by registering a handler. v2:
+
+```ts
+server.registerTool(
+  "transfer_tokens",
+  { description, inputSchema },
+  async (args, extra) => ({ content: [{ type: "text", text: "sent" }] }),
+);
+```
+
+v1 exposes the same handler shape through `server.tool(name, schema, handler)`, and
+the low-level form, `server.setRequestHandler(CallToolRequestSchema, handler)`,
+receives `request.params = { name, arguments }`. The handler is invoked only after
+a client sends `tools/call`, and the server's response *is* the tool result.
+
+On the client side, the high-level `Client` exposes
+`callTool({ name, arguments })` — the last point before the request leaves the
+process.
+
+### Why this is genuinely blockable, not observability-only
+
+A handler that is never called means the tool body — the code that signs and
+broadcasts the guarded transaction — never runs. That is the same continuation
+property the LangChain adapter depends on: the guard's verdict decides whether the
+registered handler is entered, and a refusal is returned to the client as an
+`isError: true` result instead of a transaction. Wrapping `callTool` on the client
+is the same boundary read from the egress side.
+
+There is no post-hoc-only problem to document here; unlike AutoGPT (§3), MCP
+exposes a real pre-execution point to third-party code in both generations.
+
+### What the adapter does
+
+1. `guardMcpToolHandler(toolName, handler, options)` wraps a registered handler
+   and asks the guard before invoking it.
+2. `guardMcpCallTool(callTool, options)` wraps a client's `callTool` and refuses
+   before the request is sent.
+3. On block, both return `{ content: [{ type: "text", text: refusal }], isError:
+   true }` without invoking the wrapped handler/call, and fire the shared
+   `onBlocked` operator hook (`src/adapters/shared.ts`).
+
+### Dependency stance
+
+Both generations require Zod (v1) or a Standard Schema library (v2) at the host,
+and the packages are large. The adapter is therefore written **structurally**
+against the handler / `callTool` shape, so neither package becomes a dependency of
+this SDK and no lazy peer dep is required — the same zero-dependency stance the
+LangChain and ElizaOS adapters take. No speculative code: both wrappers are
+covered by `tests/unit/adapters.test.ts`.
+
+---
+
+## 5. Vercel AI SDK — tool `execute`
+
+**Last verified: 2026-10-19.**
+
+**Pinned shape:** `ai` 5.x, the structural `Tool` interface. The adapter is
+written against `Tool.execute(input, options)`, not against the language-model
+middleware (`wrapLanguageModel`), whose stream already contains tool-call
+arguments the model emitted.
+
+```ts
+type Tool<INPUT, RESULT> = {
+  execute?: (input: INPUT, options: ToolCallOptions) => Promise<RESULT>;
+  // …description / inputSchema omitted
+};
+```
+
+### Why this is genuinely blockable, not observability-only
+
+The tool body *is* `execute`. Wrapping that function and refusing before
+calling the original means the code that signs and broadcasts a transaction is
+never entered; the AI SDK renders the thrown refusal into the model's error
+stream rather than as a tool result. `wrapLanguageModel` is **not** used:
+intercepting a model stream is post-decision, not pre-execution.
+
+### What the adapter does
+
+`createVercelAIGuard(...)(toolName, tool)` returns a copy whose `execute` asks
+the guard first. `admissible` runs the original `execute` and returns its
+result unchanged; `blocked` throws `GuardBlockedError`; `undetermined` throws
+`PreFlightUndeterminedError` — both before `execute` is entered. A tool with no
+`execute` is returned untouched.
+
+## Compatibility smoke fixtures
+
+The compatibility evidence is executable, not just a type check:
+`tests/unit/adapter-compat.test.ts` drives each framework's actual continuation
+with a tool body that counts entries, then asserts a blocked verdict leaves
+that counter at **zero**. A shape that only *looks* pre-execution would fail
+that assertion.
+
+| Framework | Shape exercised | Pin | Why the hook is pre-execution |
+| --- | --- | --- | --- |
+| LangChain | `AgentMiddleware.wrapToolCall(request, handler)` | `b7d5b8050ab887acb3f180edae17ee06c11022d2` | The handler is the continuation; a block returns without calling it. |
+| ElizaOS | `Action.validate` | `c13af759cafde630483450f97bb802b58d1b253a` | The runtime filters the eligible action set before invoking any handler. |
+| MCP v1 | client `callTool({ name, arguments })` | `2d2f19ae376bee6081437c4d6f8e251bf3fd3ce5` | A refusal is returned locally; the request never leaves the process. |
+| MCP v2 | `server.registerTool(name, config, handler)` | `6d5e2328efd2fc4493731b4e4cfd2e117ad1e28d` | The registered handler is the tool body; not calling it means it never runs. |
+| Vercel AI SDK | `Tool.execute(input, options)` | ai 5.x `Tool.execute` | The wrapped function is the tool body and is not entered on a refusal. |
+
+**Refresh procedure:** when a framework publishes a new hook revision, update
+the pin here **and** in `COMPATIBILITY_PINS` in `tests/unit/adapter-compat.test.ts`
+(the sync test fails if they diverge), re-run the fixture suite, and append the
+superseded pin to the revision log. No framework package is installed and no
+network access is needed: the fixtures are structural, by design.
+
 ## Revision log
 
 Append-only record of every superseded pin, newest last. A pin is never replaced
@@ -419,3 +541,26 @@ Superseded file-content pins are kept above rather than deleted, so the previous
 revision remains addressable. No framework gained a genuine third-party
 pre-execution blocking hook in this sweep, so no new adapter is unblocked and no
 follow-up adapter issue is filed.
+
+### 2026-09-30 — MCP spike (issue #45)
+
+| File | Pin | What was checked |
+| --- | --- | --- |
+| `modelcontextprotocol/typescript-sdk` `main` `README.md` | blob `6d5e2328efd2fc4493731b4e4cfd2e117ad1e28d` | v2 (`@modelcontextprotocol/server`) tool registration and the `Client.callTool` egress |
+| `modelcontextprotocol/typescript-sdk` `v1.x` `README.md` | blob `2d2f19ae376bee6081437c4d6f8e251bf3fd3ce5` | v1 (`@modelcontextprotocol/sdk` 1.30.1) handler registration and `Client.callTool` |
+
+Outcome: MCP has a genuine pre-execution blocking point in both generations, so
+the adapter was built rather than deferred — see §4. No superseded pin: this is
+the first MCP entry.
+
+### 2026-10-19 — compatibility smoke fixtures (issue #319)
+
+| Framework | Pin exercised | What the fixture proves |
+| --- | --- | --- |
+| LangChain | `b7d5b8050ab887acb3f180edae17ee06c11022d2` (unchanged) | a block skips `handler(request)` |
+| ElizaOS | `c13af759cafde630483450f97bb802b58d1b253a` (unchanged) | a false `validate` keeps the handler out of the eligible set |
+| MCP v1 / v2 | `2d2f19ae…` / `6d5e2328…` (unchanged) | neither the handler nor the client request is entered on a block |
+| Vercel AI SDK | ai 5.x `Tool.execute` (first pin) | a thrown refusal precedes the wrapped `execute` |
+
+No superseded pin: the fixture suite pins the same revisions already recorded
+above and adds the Vercel AI shape as a new entry.

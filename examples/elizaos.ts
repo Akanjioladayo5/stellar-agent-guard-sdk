@@ -14,13 +14,7 @@
  *       action handler is never scheduled or executed.
  *  5. Undetermined handling note (fails closed by returning `false`).
  */
-import {
-  Address,
-  Keypair,
-  nativeToScVal,
-  rpc,
-  xdr,
-} from "@stellar/stellar-sdk";
+import { Address, Keypair, nativeToScVal, rpc, xdr } from "@stellar/stellar-sdk";
 import {
   PreFlightInterceptor,
   createGuardValidator,
@@ -29,13 +23,21 @@ import {
   unsafeAccountAddress,
   type ContractCall,
   type ElizaActionLike,
-  type PreFlightDecision,
+  type GuardBlockedInfo,
 } from "../src/index.ts";
 
-export const EXAMPLE_GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
-export const EXAMPLE_TOKEN = unsafeContractAddress("CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB");
-export const ALLOWED_RECIPIENT = unsafeAccountAddress("GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ");
-export const BLOCKED_RECIPIENT = unsafeAccountAddress("GDZOKF3HGA6XSKIEEPJC5ANON3IJ5OGZMCX7GEGJLZN7JFRKOO4N2HXM");
+export const EXAMPLE_GUARD = unsafeContractAddress(
+  "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44",
+);
+export const EXAMPLE_TOKEN = unsafeContractAddress(
+  "CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB",
+);
+export const ALLOWED_RECIPIENT = unsafeAccountAddress(
+  "GA7QYNF7SOWQ3GLR2BGMZEHXAVIRZA4KVWLTJJFC7MGXUA74P7UJVSGZ",
+);
+export const BLOCKED_RECIPIENT = unsafeAccountAddress(
+  "GDZOKF3HGA6XSKIEEPJC5ANON3IJ5OGZMCX7GEGJLZN7JFRKOO4N2HXM",
+);
 
 export interface ElizaTransferState {
   token?: string;
@@ -128,7 +130,7 @@ export async function runElizaOSExample(serverOverride?: rpc.Server) {
     source,
   });
 
-  const blockedDecisions: Array<PreFlightDecision & { allowed: false }> = [];
+  const blockedDecisions: GuardBlockedInfo[] = [];
 
   // Define base ElizaOS action
   let baseValidateRan = 0;
@@ -152,8 +154,8 @@ export async function runElizaOSExample(serverOverride?: rpc.Server) {
   const action = guardAction(rawTransferAction, {
     interceptor,
     toContractCall,
-    onBlocked: (decision) => {
-      blockedDecisions.push(decision);
+    onBlocked: (info) => {
+      blockedDecisions.push(info);
     },
   });
 
@@ -205,8 +207,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     console.log("[Run 2: Blocked] Validation verdict (false => dropped):", res.blockedVerdict);
     if (res.blockedDecisions.length > 0) {
       const b = res.blockedDecisions[0]!;
-      console.log("[Run 2: Blocked] Reason:", b.kind === "blocked" ? b.reason : b.kind);
-      console.log("[Run 2: Blocked] Explanation:", b.kind === "blocked" ? b.explanation : b.detail);
+      console.log(`[Run 2: Blocked] adapter=${b.adapter} kind=${b.kind}`);
+      console.log("[Run 2: Blocked] Reason:", b.reason ?? b.kind);
+      console.log("[Run 2: Blocked] Explanation:", b.explanation);
     }
   });
 }

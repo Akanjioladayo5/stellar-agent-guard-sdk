@@ -13,6 +13,7 @@ import {
   ContractResponseError,
   GuardBlockedError,
   GuardError,
+  GuardUndeterminedError,
   PolicyDecodeError,
   PreFlightUndeterminedError,
   SigningError,
@@ -30,6 +31,7 @@ describe("typed guard errors", () => {
       new ContractResponseError("response", { field: "result" }),
       new PolicyDecodeError("policy", { path: "assets[0]" }),
       new GuardBlockedError({ reason: "paused", stage: "preflight" }),
+      new GuardUndeterminedError("no verdict"),
       new PreFlightUndeterminedError("no verdict"),
     ];
 
@@ -57,10 +59,22 @@ describe("typed guard errors", () => {
     assert.match(error.message, /1001 > 1000/);
   });
 
-  it("models an undetermined preflight as a typed simulation failure", () => {
+  it("models an undetermined preflight as a typed undetermined failure", () => {
+    const cause = new Error("RPC unavailable");
+    const error = new GuardUndeterminedError("could not classify", { cause });
+    assert.ok(error instanceof GuardUndeterminedError);
+    assert.ok(error instanceof GuardError);
+    assert.equal(error.stage, "preflight");
+    assert.equal(error.detail, "could not classify");
+    assert.equal(error.cause, cause);
+  });
+
+  it("retains PreFlightUndeterminedError compatibility as an alias to GuardUndeterminedError", () => {
     const cause = new Error("RPC unavailable");
     const error = new PreFlightUndeterminedError("could not classify", { cause });
-    assert.ok(error instanceof SimulationError);
+    assert.ok(error instanceof GuardUndeterminedError);
+    assert.ok(error instanceof PreFlightUndeterminedError);
+    assert.ok(error instanceof GuardError);
     assert.equal(error.stage, "preflight");
     assert.equal(error.detail, "could not classify");
     assert.equal(error.cause, cause);
@@ -78,15 +92,10 @@ describe("typed guard errors", () => {
     assert.equal(broadcast.cause, cause);
   });
 
-  it("throws ContractResponseError for an unexpected CheckResult", () => {
-    assert.throws(
-      () => decodeCheckResult({ SomethingElse: true }),
-      (error: unknown) => {
-        assert.ok(error instanceof ContractResponseError);
-        assert.equal(error.field, "CheckResult");
-        return true;
-      },
-    );
+  it("fails closed instead of throwing for an unexpected CheckResult", () => {
+    // The decoder is total by design: a hostile or future payload must resolve
+    // to the typed `undetermined` fallback, never an exception in the verdict path.
+    assert.deepEqual(decodeCheckResult({ SomethingElse: true }), { kind: "undetermined" });
   });
 
   it("throws PolicyDecodeError with the failing field path", () => {

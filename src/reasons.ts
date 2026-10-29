@@ -8,6 +8,20 @@
  * topic (`event_auth_checked` → `blocked, <reason>`). Off-chain code and on-chain
  * code therefore share one vocabulary, which is why this table is duplicated
  * rather than inferred.
+ *
+ * The table is checked against the contracts repo's own vocabulary fixture —
+ * `tests/fixtures/vendor/auth-checked-vocabulary.json`, vendored from
+ * `stellar-agent-guard-contracts/tests/fixtures/auth-checked-vocabulary.json` —
+ * so a reason the contract adds is a failing test here until this table is
+ * extended, rather than a symbol the SDK silently mislabels.
+ *
+ * The operator-facing guidance below (`reasonMessagesEn`, served by
+ * `explainReason`) is checked the same way, against the contract's reason
+ * glossary — vendored machine-readable at
+ * `tests/fixtures/vendor/reasons.fixture.json` from
+ * `stellar-agent-guard-contracts/docs/reason-glossary.md` (issue #38). The
+ * parity test is bidirectional: a glossary reason without SDK guidance fails,
+ * and an SDK reason the glossary does not list fails too.
  */
 import { GuardError } from "./errors.ts";
 
@@ -17,6 +31,7 @@ export const GUARD_REASON_CODES = {
   not_initialized: 3,
   invalid_config: 4,
   invalid_amount: 5,
+  no_pending_admin: 6,
   admin_frozen: 10,
   heartbeat_expired: 11,
   no_policy: 12,
@@ -31,6 +46,11 @@ export const GUARD_REASON_CODES = {
   unknown_contract: 26,
   self_function_not_allowed: 27,
   create_contract_not_allowed: 28,
+  recipient_blocked: 29,
+  protocol_call_rate_exceeded: 30,
+  decision_invariant_violation: 31,
+  asset_fn_not_allowed: 32,
+  too_many_auth_contexts: 33,
 } as const;
 
 /**
@@ -78,28 +98,199 @@ const BY_CODE = new Map<number, GuardReason>(
   Object.entries(GUARD_REASON_CODES).map(([name, code]) => [code, name as GuardReason]),
 );
 
-/** Human-readable, one-line meaning per reason, for surfacing to operators. */
-const EXPLANATIONS: Record<GuardReason, string> = {
-  unauthorized: "The presented signature did not verify against the account's registered agent key.",
-  already_initialized: "The guard account has already been initialized.",
-  not_initialized: "The guard account has no registered agent key yet.",
-  invalid_config: "The policy configuration was rejected by validation and was not applied.",
-  invalid_amount: "The transfer amount was zero or negative.",
-  admin_frozen: "An admin froze the account (freeze), or the dead-man switch grace window lapsed.",
-  heartbeat_expired: "The dead-man switch fired: no heartbeat within the policy's grace window, so the account is frozen until an admin unfreezes it.",
-  no_policy: "No policy is installed (never set, or revoked) — the account is default-deny.",
-  paused: "The policy's admin kill switch is engaged.",
-  outside_active_window: "The current ledger time is outside the policy's active_from/active_until window.",
-  asset_not_allowed: "The SAC token being called is not in the policy's assets list.",
-  recipient_not_allowed: "The transfer recipient is not in the policy's recipients allowlist.",
-  per_tx_cap_exceeded: "The transfer amount exceeds the policy's per-transaction cap.",
-  window_cap_exceeded: "The transfer would push cumulative spend over the rolling-window cap.",
-  protocol_not_allowed: "The contract being called is not in the policy's protocols allowlist.",
-  function_not_allowed: "The function being called on an allowlisted contract is not in its function allowlist.",
-  unknown_contract: "The contract being called is neither the account itself, an allowlisted asset, nor an allowlisted protocol (default deny).",
-  self_function_not_allowed: "The call targets a guard function that the agent key may not invoke.",
-  create_contract_not_allowed: "The account may not authorize contract creation.",
-};
+/**
+ * A reason's stable message keys plus its numeric contract code (issue #96).
+ *
+ * The keys — not concatenated English sentences — are the contract a consumer
+ * builds against: a dashboard can look up its own translation for
+ * `bodyKey`, and a locale change never churns the diff of a consumer that only
+ * reads the keys. The keys are namespaced (`guard.reason.<reason>.<part>`) and
+ * derived from the reason name, so they cannot drift from the vocabulary above.
+ */
+export interface ReasonMessage {
+  /** The contract's numeric enum value for this reason. */
+  code: number;
+  /** Key for a short human title, e.g. a table row heading. */
+  titleKey: string;
+  /** Key for the one-line explanation returned by `explainReason`. */
+  bodyKey: string;
+  /** Key for operator remediation guidance. */
+  remediationKey: string;
+}
+
+/**
+ * The reason structure map, derived from the single `GUARD_REASON_CODES` source
+ * so a reason cannot exist in one and not the other. This is the map a consumer
+ * iterates to render a table or to key its own translations; the English text
+ * itself lives in `reasonMessagesEn`.
+ */
+export const reasonMessages: Readonly<Record<GuardReason, ReasonMessage>> = Object.freeze(
+  (Object.keys(GUARD_REASON_CODES) as GuardReason[]).reduce(
+    (messages, reason) => {
+      messages[reason] = {
+        code: GUARD_REASON_CODES[reason],
+        titleKey: `guard.reason.${reason}.title`,
+        bodyKey: `guard.reason.${reason}.body`,
+        remediationKey: `guard.reason.${reason}.remediation`,
+      };
+      return messages;
+    },
+    {} as Record<GuardReason, ReasonMessage>,
+  ),
+);
+
+/** The three pieces of operator-facing English text for one reason. */
+export interface ReasonMessageText {
+  /** Short heading, e.g. "Per-transaction cap exceeded". */
+  title: string;
+  /** One-line meaning; `explainReason` returns this by default. */
+  body: string;
+  /** What an operator or agent can do about it. */
+  remediation: string;
+}
+
+/**
+ * A locale's catalog: message key -> translated string. Missing keys fall back
+ * to the English default, so a partial translation is safe to ship.
+ */
+export type ReasonMessageCatalog = Readonly<Record<string, string>>;
+
+/**
+ * The built-in English messages, keyed by reason (issue #96).
+ *
+ * This is the zero-dependency default locale: no i18n framework is pulled in,
+ * just maps. `explainReason(reason)` returns `body` byte-for-byte as the SDK
+ * always has; `title` and `remediation` are the additional text a table or an
+ * operator alert can use without the SDK inventing a format for them.
+ */
+export const reasonMessagesEn: Readonly<Record<GuardReason, ReasonMessageText>> = Object.freeze({
+  unauthorized: {
+    title: "Unauthorized agent key",
+    body: "The presented signature did not verify against the account's registered agent key.",
+    remediation: "Register the agent key on the guard account, or sign with the registered key.",
+  },
+  already_initialized: {
+    title: "Already initialized",
+    body: "The guard account has already been initialized.",
+    remediation: "Read the existing guard state instead of initializing it again.",
+  },
+  not_initialized: {
+    title: "Guard not initialized",
+    body: "The guard account has no registered agent key yet.",
+    remediation: "Initialize the guard account and register an agent key.",
+  },
+  invalid_config: {
+    title: "Invalid policy configuration",
+    body: "The policy configuration was rejected by validation and was not applied.",
+    remediation: "Fix the failing validation rules and re-submit the policy.",
+  },
+  invalid_amount: {
+    title: "Invalid amount",
+    body: "The transfer amount was zero or negative.",
+    remediation: "Send a positive transfer amount.",
+  },
+  no_pending_admin: {
+    title: "No pending admin rotation",
+    body: "The account has no pending admin rotation to confirm or cancel.",
+    remediation: "Start an admin rotation first, then confirm or cancel it.",
+  },
+  admin_frozen: {
+    title: "Account frozen",
+    body: "An admin froze the account (freeze), or the dead-man switch grace window lapsed.",
+    remediation: "Unfreeze the account with an admin signature, or check the dead-man switch.",
+  },
+  heartbeat_expired: {
+    title: "Heartbeat expired",
+    body: "The dead-man switch fired: no heartbeat within the policy's grace window, so the account is frozen until an admin unfreezes it.",
+    remediation: "Have an admin unfreeze the account, then resume agent heartbeats.",
+  },
+  no_policy: {
+    title: "No policy installed",
+    body: "No policy is installed (never set, or revoked) — the account is default-deny.",
+    remediation: "Install a policy for the account before the agent transacts.",
+  },
+  paused: {
+    title: "Policy paused",
+    body: "The policy's admin kill switch is engaged.",
+    remediation: "Clear the policy's paused flag as the policy admin.",
+  },
+  outside_active_window: {
+    title: "Outside active window",
+    body: "The current ledger time is outside the policy's active_from/active_until window.",
+    remediation: "Retry within the policy's active_from/active_until window.",
+  },
+  asset_not_allowed: {
+    title: "Asset not allowed",
+    body: "The SAC token being called is not in the policy's assets list.",
+    remediation: "Add the SAC token to the policy's assets list.",
+  },
+  recipient_not_allowed: {
+    title: "Recipient not allowed",
+    body: "The transfer recipient is not in the policy's recipients allowlist.",
+    remediation: "Add the recipient to the policy's allowlist.",
+  },
+  per_tx_cap_exceeded: {
+    title: "Per-transaction cap exceeded",
+    body: "The transfer amount exceeds the policy's per-transaction cap.",
+    remediation: "Reduce the transfer to the policy's per-transaction cap or below.",
+  },
+  window_cap_exceeded: {
+    title: "Rolling-window cap exceeded",
+    body: "The transfer would push cumulative spend over the rolling-window cap.",
+    remediation: "Wait for the rolling window to free capacity, or reduce the amount.",
+  },
+  protocol_not_allowed: {
+    title: "Protocol not allowed",
+    body: "The contract being called is not in the policy's protocols allowlist.",
+    remediation: "Add the contract to the policy's protocols allowlist.",
+  },
+  function_not_allowed: {
+    title: "Function not allowed",
+    body: "The function being called on an allowlisted contract is not in its function allowlist.",
+    remediation: "Add the function to the allowlisted contract's function list.",
+  },
+  unknown_contract: {
+    title: "Unknown contract",
+    body: "The contract being called is neither the account itself, an allowlisted asset, nor an allowlisted protocol (default deny).",
+    remediation: "Allowlist the contract as an asset or protocol, or call the account itself.",
+  },
+  self_function_not_allowed: {
+    title: "Guard function not permitted",
+    body: "The call targets a guard function that the agent key may not invoke.",
+    remediation: "Invoke the guard function from an admin key, not the agent key.",
+  },
+  create_contract_not_allowed: {
+    title: "Contract creation not permitted",
+    body: "The account may not authorize contract creation.",
+    remediation: "Create the contract from an admin account instead of the guarded account.",
+  },
+  recipient_blocked: {
+    title: "Recipient blocked",
+    body: "The transfer recipient is explicitly blocked by the account's policy.",
+    remediation: "Send to a different recipient, or remove the block if it is no longer wanted.",
+  },
+  protocol_call_rate_exceeded: {
+    title: "Protocol call rate exceeded",
+    body: "The call would push the rolling protocol-call count past its configured limit.",
+    remediation: "Wait for the rolling window to free capacity, or make fewer protocol calls.",
+  },
+  decision_invariant_violation: {
+    title: "Decision invariant violation",
+    body: "The guard's decision engine hit an internal invariant, so the call was refused rather than allowed.",
+    remediation:
+      "Treat this as a guard defect: capture the call and report it to the contract maintainers.",
+  },
+  asset_fn_not_allowed: {
+    title: "Asset function not permitted",
+    body: "The call invoked a function other than `transfer` on an allowlisted asset.",
+    remediation: "Call `transfer`, or allowlist the asset's function explicitly.",
+  },
+  too_many_auth_contexts: {
+    title: "Too many authorization contexts",
+    body: "The call carried more authorization contexts than the guard's decision engine evaluates.",
+    remediation: "Split the call so each authorization carries fewer contexts.",
+  },
+});
 
 export function reasonNameFromCode(code: number): GuardReason | undefined {
   return BY_CODE.get(code);
@@ -111,9 +302,37 @@ export function reasonName(reason: number | string): GuardReason | string {
   return reason;
 }
 
-export function explainReason(reason: number | string): string {
+/**
+ * Human-readable, one-line explanation for a guard reason.
+ *
+ * The default call is unchanged: `explainReason(reason)` returns the same
+ * English string it always has (the `body` from `reasonMessagesEn`), so no
+ * existing caller sees a different refusal. Two optional arguments make it
+ * localisable without a framework (issue #96):
+ *
+ * - `locale` is a `key -> translation` catalog, typically built from
+ *   `reasonMessages[reason].bodyKey`. A key the catalog omits falls back to
+ *   English, so a partial translation is safe.
+ * - `overrides` lets a consumer replace individual reasons outright (theming a
+ *   dashboard, house wording) without forking the SDK.
+ *
+ * An unrecognised reason is still never thrown on: it yields
+ * `Unrecognised guard reason: <value>`, exactly as before.
+ */
+export function explainReason(
+  reason: number | string,
+  locale?: ReasonMessageCatalog,
+  overrides?: Partial<Record<GuardReason, string>>,
+): string {
   const name = reasonName(reason);
-  return EXPLANATIONS[name as GuardReason] ?? `Unrecognised guard reason: ${String(reason)}`;
+  if (!isGuardReason(name)) {
+    return `Unrecognised guard reason: ${String(reason)}`;
+  }
+  const override = overrides?.[name];
+  if (override !== undefined) return override;
+  const english = reasonMessagesEn[name].body;
+  if (locale === undefined) return english;
+  return locale[reasonMessages[name].bodyKey] ?? english;
 }
 
 import type { ContractCall } from "./tx.ts";
@@ -179,9 +398,7 @@ export class GuardBlockedError extends GuardError {
     this.name = "GuardBlockedError";
     this.reason = name;
     this.code =
-      typeof params.reason === "number"
-        ? params.reason
-        : GUARD_REASON_CODES[name as GuardReason];
+      typeof params.reason === "number" ? params.reason : GUARD_REASON_CODES[name as GuardReason];
     this.explanation = explanation;
     this.stage = params.stage;
     this.charged = params.charged ?? false;
